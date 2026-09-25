@@ -20,6 +20,15 @@ FACILITATOR_URL = "https://x402-facilitator.cdp.coinbase.com"
 CDP_API_KEY_NAME = os.environ.get("CDP_API_KEY_NAME", "")
 CDP_API_KEY_PRIVATE_KEY = os.environ.get("CDP_API_KEY_PRIVATE_KEY", "")
 
+# --- Nano (XNO) rail ---
+# A nano_ address the operator controls. When set, routes that opt in with a
+# `nano_price` also carry a nano:mainnet/XNO accept and settle from a verified
+# XNO send (see nano.py). Leave empty to keep the rail entirely off.
+NANO_TREASURY = os.environ.get("NANO_TREASURY", "").strip()
+# Require the send to be cemented (final, unrollbackable) before serving work.
+NANO_REQUIRE_CEMENTED = os.environ.get("NANO_REQUIRE_CEMENTED", "").lower() in ("1", "true", "yes")
+
+
 # --- Swap Info ---
 SWAP_INFO = {
     "wrtc_contract": WRTC_BASE,

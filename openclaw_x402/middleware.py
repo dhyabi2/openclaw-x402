@@ -19,12 +19,14 @@ Usage:
 import functools
 import logging
 import time
+from decimal import Decimal
 
 from flask import jsonify, request
 
 from .config import (
     X402_NETWORK, USDC_BASE, FACILITATOR_URL, SWAP_INFO,
     is_free, has_cdp_credentials,
+    NANO_TREASURY, NANO_REQUIRE_CEMENTED,
 )
 
 log = logging.getLogger("openclaw_x402")
@@ -104,7 +106,7 @@ class X402Middleware:
                 "swap_info": SWAP_INFO,
             })
 
-    def premium(self, price="0", description="Premium endpoint"):
+    def premium(self, price="0", description="Premium endpoint", nano_price=None):
         """
         Decorator to enforce x402 payment on a route.
 
@@ -113,16 +115,37 @@ class X402Middleware:
           - With x402 lib: uses Coinbase facilitator for verification
           - Without x402 lib: returns 402 with manual payment instructions
 
+        When `nano_price` (an XNO amount, e.g. "0.0005") is given AND NANO_TREASURY
+        is configured, the route also accepts a Nano (XNO) settlement: the 402
+        carries a nano:mainnet accept, and a request with an `X-NANO-PAYMENT`
+        header (the send block hash) is served only when the send verifies on
+        chain (see openclaw_x402.nano.verify_send). Any other request still
+        fails closed with a 402.
+
         Args:
             price: USDC atomic units (6 decimals). "10000" = $0.01
             description: Human-readable endpoint description
+            nano_price: optional XNO amount string to also accept on the Nano rail.
         """
+        nano_accept = bool(nano_price and NANO_TREASURY)
+
         def decorator(f):
             @functools.wraps(f)
             def wrapper(*args, **kwargs):
                 # Free mode — pass through
                 if is_free(price):
                     return f(*args, **kwargs)
+
+                # Nano rail first: a verified XNO send settles the request
+                # directly, with nothing to relay and fail-closed otherwise.
+                if nano_accept:
+                    sent, reason = self._verify_nano_payment(
+                        nano_price, description, request.path
+                    )
+                    if sent:
+                        return f(*args, **kwargs)
+                    if reason:
+                        log.warning("Rejected Nano payment for %s: %s", request.path, reason)
 
                 # Check for x402 payment header
                 payment_header = request.headers.get("X-PAYMENT", "").strip()
@@ -140,26 +163,73 @@ class X402Middleware:
                         "(facilitator verification not implemented; failing closed)",
                         request.path,
                     )
-                return self._payment_required(price, description)
+                return self._payment_required(price, description, nano_price)
 
             return wrapper
         return decorator
 
-    def _payment_required(self, price, description):
+    def _verify_nano_payment(self, nano_price, description, path):
+        """Return (accepted, reason) for an X-NANO-PAYMENT attempt.
+
+        Works only when NANO_TREASURY is set. The header carries the send block
+        hash; the send is verified on chain (amount, destination, receipt,
+        optional cementing) and the request is served only when settled is True.
+        Anything else — no header, an unreadable block, an underpaid or
+        misaddressed send — is refused (fail closed).
+        """
+        if not NANO_TREASURY:
+            return False, "nano rail not configured"
+        from .nano import verify_send
+
+        block_hash = request.headers.get("X-NANO-PAYMENT", "").strip()
+        if not block_hash:
+            return False, "no X-NANO-PAYMENT block hash"
+
+        # price is an XNO decimal string; convert to raw for the challenge.
+        amount_raw = str(int(Decimal(str(nano_price)) * (Decimal(10) ** 30)))
+        try:
+            receipt = verify_send(
+                block_hash, NANO_TREASURY, amount_raw,
+                require_cemented=NANO_REQUIRE_CEMENTED,
+            )
+        except Exception as e:  # node unreachable -> uncertainty -> fail closed
+            return False, "nano verify error: %s" % e
+
+        if receipt.get("settled") is True:
+            self._log_payment(
+                receipt.get("proof", {}).get("to", ""),
+                path,
+                receipt.get("amount_xno", nano_price),
+                receipt.get("proof", {}).get("receive_block") or block_hash,
+                description + " (nano)",
+            )
+            return True, None
+        return False, "; ".join(receipt.get("reasons", [])) or "nano payment not settled"
+
+    def _payment_required(self, price, description, nano_price=None):
         """Return HTTP 402 with x402 payment instructions."""
+        x402 = {
+            "version": "1",
+            "network": X402_NETWORK,
+            "asset": USDC_BASE,
+            "payTo": self.treasury,
+            "maxAmountRequired": price,
+            "facilitator": FACILITATOR_URL,
+            "resource": request.url,
+            "description": description,
+        }
+        if nano_price and NANO_TREASURY:
+            from .nano import build_challenge
+            x402["nano"] = build_challenge(
+                request.url, NANO_TREASURY,
+                str(int(Decimal(str(nano_price)) * (Decimal(10) ** 30))),
+                description=description + " (XNO)",
+            )["resources"][0]
         return jsonify({
             "error": "Payment Required",
-            "x402": {
-                "version": "1",
-                "network": X402_NETWORK,
-                "asset": USDC_BASE,
-                "payTo": self.treasury,
-                "maxAmountRequired": price,
-                "facilitator": FACILITATOR_URL,
-                "resource": request.url,
-                "description": description,
-            },
+            "x402": x402,
         }), 402
+
 
     def _log_payment(self, payer, endpoint, amount, tx_hash, description):
         """Log a payment to the database."""
