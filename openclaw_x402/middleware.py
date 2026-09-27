@@ -18,6 +18,7 @@ Usage:
 
 import functools
 import logging
+import secrets
 import time
 from decimal import Decimal
 
@@ -26,7 +27,7 @@ from flask import jsonify, request
 from .config import (
     X402_NETWORK, USDC_BASE, FACILITATOR_URL, SWAP_INFO,
     is_free, has_cdp_credentials,
-    NANO_TREASURY, NANO_REQUIRE_CEMENTED,
+    NANO_TREASURY, NANO_REQUIRE_CEMENTED, NANO_CHALLENGE_TTL,
 )
 
 log = logging.getLogger("openclaw_x402")
@@ -74,6 +75,7 @@ class X402Middleware:
             return
         try:
             db = self.db_func()
+            db.execute("""PRAGMA foreign_keys=ON""")
             db.execute("""
                 CREATE TABLE IF NOT EXISTS x402_payments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,8 +84,29 @@ class X402Middleware:
                     amount_usdc TEXT NOT NULL,
                     tx_hash TEXT,
                     network TEXT DEFAULT 'eip155:8453',
+                    currency TEXT DEFAULT 'USDC',
                     description TEXT,
                     created_at REAL NOT NULL
+                )
+            """)
+            # Nano spent-hash ledger: a block hash may be consumed exactly once.
+            # The UNIQUE constraint is what defeats replay - a second attempt
+            # to serve the same send hash fails the INSERT and is refused.
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS nano_spent (
+                    send_hash TEXT PRIMARY KEY,
+                    consumed_at REAL NOT NULL,
+                    path TEXT NOT NULL
+                )
+            """)
+            # Issued (unconsumed) challenges, each carrying a unique tagged raw
+            # amount so a send is bound to the exact challenge it was issued for.
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS nano_challenges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL,
+                    amount_raw TEXT NOT NULL,
+                    expires_at REAL NOT NULL
                 )
             """)
             db.commit()
@@ -144,8 +167,17 @@ class X402Middleware:
                     )
                     if sent:
                         return f(*args, **kwargs)
-                    if reason:
-                        log.warning("Rejected Nano payment for %s: %s", request.path, reason)
+                    # Only log a warning when the request actually presented an
+                    # X-NANO-PAYMENT header and was refused. A normal 402 with no
+                    # header is the expected first round of the handshake, not
+                    # noise worth a WARNING on every miss.
+                    nano_header_present = bool(
+                        request.headers.get("X-NANO-PAYMENT", "").strip()
+                    )
+                    if reason and nano_header_present:
+                        log.warning(
+                            "Rejected Nano payment for %s: %s", request.path, reason
+                        )
 
                 # Check for x402 payment header
                 payment_header = request.headers.get("X-PAYMENT", "").strip()
@@ -173,38 +205,159 @@ class X402Middleware:
 
         Works only when NANO_TREASURY is set. The header carries the send block
         hash; the send is verified on chain (amount, destination, receipt,
-        optional cementing) and the request is served only when settled is True.
-        Anything else — no header, an unreadable block, an underpaid or
-        misaddressed send — is refused (fail closed).
+        optional cementing) *and* bound to a challenge this route issued: the
+        send must be for exactly the tagged amount of a live challenge for this
+        path, and the hash must not have been spent before (atomic UNIQUE
+        insert). The request is served only when all of that holds; anything
+        else - no header, a malformed hash, an unreadable block, an underpaid,
+        misaddressed or already-spent send - is refused (fail closed).
         """
         if not NANO_TREASURY:
             return False, "nano rail not configured"
-        from .nano import verify_send
+        from .nano import verify_send, valid_block_hash
 
         block_hash = request.headers.get("X-NANO-PAYMENT", "").strip()
         if not block_hash:
             return False, "no X-NANO-PAYMENT block hash"
+        if not valid_block_hash(block_hash):
+            # Malformed header: refuse before spending any RPC on it. This also
+            # keeps the independent-read amplification cost away from junk input.
+            return False, "malformed block hash (not 64 hex)"
 
         # price is an XNO decimal string; convert to raw for the challenge.
-        amount_raw = str(int(Decimal(str(nano_price)) * (Decimal(10) ** 30)))
+        base_amount_raw = str(int(Decimal(str(nano_price)) * (Decimal(10) ** 30)))
+
+        # Bound the send to the challenge this route issued. The 402 carried a
+        # unique tagged amount; the send MUST pay exactly that. This is what
+        # keeps a third-party send to the treasury unclaimable and stops a
+        # payment issued for one route settling another.
+        if self.db_func:
+            expected = self._active_challenge_amount(path)
+            if expected is None:
+                return False, "no live challenge issued for this route"
+        else:
+            # No durable store => cannot bind or consume safely. Fail closed so
+            # a send can never be replayed on this rail.
+            return False, "nano rail requires a payment store (db_func) to bind and consume sends"
+
         try:
             receipt = verify_send(
-                block_hash, NANO_TREASURY, amount_raw,
+                block_hash, NANO_TREASURY, base_amount_raw,
                 require_cemented=NANO_REQUIRE_CEMENTED,
+                exact_amount=expected,
             )
         except Exception as e:  # node unreachable -> uncertainty -> fail closed
             return False, "nano verify error: %s" % e
 
-        if receipt.get("settled") is True:
-            self._log_payment(
-                receipt.get("proof", {}).get("to", ""),
-                path,
-                receipt.get("amount_xno", nano_price),
-                receipt.get("proof", {}).get("receive_block") or block_hash,
-                description + " (nano)",
+        if receipt.get("settled") is not True:
+            return False, "; ".join(receipt.get("reasons", [])) or "nano payment not settled"
+
+        # Atomically consume the send hash. If it was already spent (or the
+        # store is unavailable), refuse - a single send may not pay for more
+        # than one served request, and a hash read from the treasury's own
+        # public history may not be replayed by anyone.
+        if not self._consume_send(block_hash, path):
+            return False, "send hash already spent"
+
+        # Accounting: the payer is the SENDER of the block, never the treasury.
+        sender = receipt.get("proof", {}).get("from") or receipt.get("proof", {}).get("to", "")
+        self._log_payment(
+            sender,
+            path,
+            receipt.get("amount_xno", nano_price),
+            block_hash,
+            description + " (nano)",
+            currency="XNO",
+        )
+        return True, None
+
+    def _issue_challenge(self, path, base_amount_raw):
+        """Issue a Nano challenge bound to this route and return its tagged amount.
+
+        Nano has no memo field, so the send is bound to the challenge by giving
+        each challenge a *unique* raw amount: the quoted price plus a random
+        dust tag in the low-order raw. Only a send of exactly that amount
+        satisfies the challenge, so a third-party send to the treasury at the
+        plain price can never be claimed, and a payer cannot reuse a payment
+        issued for a different route. The challenge expires so stale rows do not
+        accumulate. Returns (challenge_id, tagged_amount_raw).
+        """
+        now = time.time()
+        # A random dust tag in [0, 10**18) raw keeps the exact amount unique
+        # while staying astronomically below the price (a nano_price is normally
+        # >= 0.00001 XNO = 10**25 raw), so the tag never confuses the price.
+        dust = secrets.randbelow(10 ** 18)
+        tagged = int(base_amount_raw) + dust
+        db = self.db_func() if self.db_func else None
+        challenge_id = None
+        if db is not None:
+            try:
+                cur = db.execute(
+                    "INSERT INTO nano_challenges (path, amount_raw, expires_at) "
+                    "VALUES (?, ?, ?)",
+                    (path, str(tagged), now + NANO_CHALLENGE_TTL),
+                )
+                db.commit()
+                challenge_id = cur.lastrowid
+            except Exception as e:
+                log.warning("Failed to record nano challenge: %s", e)
+        return challenge_id, tagged
+
+    def _consume_send(self, send_hash, path):
+        """Atomically mark a send hash as spent. Returns True if it was free.
+
+        The PRIMARY KEY on nano_spent.send_hash means two concurrent requests
+        bearing the same send hash race the INSERT; exactly one wins, the other
+        gets IntegrityError and is refused. This is what stops a single send
+        from paying for unlimited requests, and what stops anyone replaying a
+        hash they read from the treasury's public history.
+        """
+        if not self.db_func:
+            # No DB configured: fail safe by refusing (a middleware with no
+            # durable store cannot prove a hash was not already spent).
+            return False
+        try:
+            db = self.db_func()
+            db.execute(
+                "INSERT INTO nano_spent (send_hash, consumed_at, path) VALUES (?, ?, ?)",
+                (send_hash, time.time(), path),
             )
-            return True, None
-        return False, "; ".join(receipt.get("reasons", [])) or "nano payment not settled"
+            db.commit()
+            return True
+        except Exception:
+            # UNIQUE violation (or any store error) => already spent / unsafe.
+            return False
+
+    def _active_challenge_amount(self, path):
+        """Return the tagged raw amount of a live unconsumed challenge for path.
+
+        A challenge is 'live' when it has not expired. To keep the binding
+        unambiguous we accept a send only when it matches the *most recent* live
+        challenge for this route; older overlapping challenges are treated as
+        superseded so an old quote cannot be replayed after a newer one was
+        issued. Returns an int or None.
+        """
+        if not self.db_func:
+            return None
+        try:
+            db = self.db_func()
+            now = time.time()
+            row = db.execute(
+                "SELECT amount_raw FROM nano_challenges "
+                "WHERE path = ? AND expires_at > ? "
+                "ORDER BY id DESC LIMIT 1",
+                (path, now),
+            ).fetchone()
+            # Expire stale rows for this path so the table does not grow forever.
+            db.execute(
+                "DELETE FROM nano_challenges WHERE path = ? AND expires_at <= ?",
+                (path, now),
+            )
+            db.commit()
+            return int(row[0]) if row else None
+        except Exception as e:
+            log.warning("Failed to read nano challenge: %s", e)
+            return None
 
     def _payment_required(self, price, description, nano_price=None):
         """Return HTTP 402 with x402 payment instructions."""
@@ -220,27 +373,36 @@ class X402Middleware:
         }
         if nano_price and NANO_TREASURY:
             from .nano import build_challenge
+            base_raw = int(Decimal(str(nano_price)) * (Decimal(10) ** 30))
+            # Issue a challenge the payer must satisfy: a unique tagged raw
+            # amount stored server-side. Even without a DB we bind by amount and
+            # fail safe (no consumption) rather than serve unproven work.
+            _, tagged = self._issue_challenge(request.path, base_raw)
             x402["nano"] = build_challenge(
                 request.url, NANO_TREASURY,
-                str(int(Decimal(str(nano_price)) * (Decimal(10) ** 30))),
+                str(tagged),
                 description=description + " (XNO)",
             )["resources"][0]
+            if self.db_func:
+                # Surface the challenge id so the payer can prove which challenge
+                # the send satisfies; bind is enforced in _verify_nano_payment.
+                x402["nano"]["challenge"] = request.path
         return jsonify({
             "error": "Payment Required",
             "x402": x402,
         }), 402
 
 
-    def _log_payment(self, payer, endpoint, amount, tx_hash, description):
+    def _log_payment(self, payer, endpoint, amount, tx_hash, description, currency="USDC"):
         """Log a payment to the database."""
         if not self.db_func:
             return
         try:
             db = self.db_func()
             db.execute(
-                "INSERT INTO x402_payments (payer_address, endpoint, amount_usdc, tx_hash, description, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (payer, endpoint, amount, tx_hash, description, time.time()),
+                "INSERT INTO x402_payments (payer_address, endpoint, amount_usdc, tx_hash, currency, description, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (payer, endpoint, amount, tx_hash, currency, description, time.time()),
             )
             db.commit()
         except Exception as e:

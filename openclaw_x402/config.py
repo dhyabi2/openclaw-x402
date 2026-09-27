@@ -27,6 +27,9 @@ CDP_API_KEY_PRIVATE_KEY = os.environ.get("CDP_API_KEY_PRIVATE_KEY", "")
 NANO_TREASURY = os.environ.get("NANO_TREASURY", "").strip()
 # Require the send to be cemented (final, unrollbackable) before serving work.
 NANO_REQUIRE_CEMENTED = os.environ.get("NANO_REQUIRE_CEMENTED", "").lower() in ("1", "true", "yes")
+# Lifetime of an issued Nano challenge, in seconds. A quoted tagged amount is
+# only valid for this window, after which the payer must fetch a fresh 402.
+NANO_CHALLENGE_TTL = float(os.environ.get("NANO_CHALLENGE_TTL", "300"))
 
 
 # --- Swap Info ---
